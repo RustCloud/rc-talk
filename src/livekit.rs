@@ -1,5 +1,4 @@
-//! LiveKit: every call, two people too, is a LiveKit room (core-response.md,
-//! 1б). Talk checks that the user is a member of the chat and signs a JWT
+//! LiveKit: every call, two people too, is a LiveKit room. Talk checks that the user is a member of the chat and signs a JWT
 //! (HS256) with the API key and secret from the server settings; the secret
 //! never reaches the browser.
 //!

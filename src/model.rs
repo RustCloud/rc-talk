@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 pub const ENVELOPE_VERSION: u8 = 1;
 
 /// The most an envelope may take, serialized: `data` of a job from
-/// `jobs.add-for` (64 KiB, maintainers' answer, item 1).
+/// `jobs.add-for` (64 KiB).
 pub const MAX_ENVELOPE: usize = 64 * 1024;
 
 /// The most text one message carries, in JSON bytes; longer text is sent as

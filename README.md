@@ -3,8 +3,7 @@
 Плагин общения для RustCloud: личные и групповые чаты между пользователями облака, звонки через
 LiveKit (когда ядро даст `permissions.media`). Нужен RustCloud с API плагинов 0.2.19.
 
-Устройство — [docs/design.md](docs/design.md). Что нужно от ядра —
-[core-proposal.md](core-proposal.md) и ответ разработчиков [core-response.md](core-response.md).
+Устройство — [docs/design.md](docs/design.md).
 
 ## Сборка
 

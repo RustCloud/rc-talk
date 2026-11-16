@@ -1,8 +1,7 @@
 # rc-talk: устройство
 
 Плагин общения для RustCloud: личные и групповые чаты между пользователями облака, звонки через
-LiveKit. Решения по ядру — [core-proposal.md](../core-proposal.md), ответ разработчиков
-[core-response.md](../core-response.md) и их ответы на уточнения (переписка 2026-11-16, сведены ниже).
+LiveKit. Что плагин берёт у ядра (API 0.2.19) — в `docs/dev/plugins.md` RustCloud.
 
 ## Модули
 
