@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Talk</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="side">
+        <header>
+          <button id="add-contact" type="button"></button>
+          <button id="add-group" type="button"></button>
+        </header>
+        <div id="notice" hidden></div>
+        <section id="requests"></section>
+        <nav id="rooms"></nav>
+      </aside>
+      <main id="chat">
+        <div id="empty"></div>
+        <header id="chat-head" hidden>
+          <button id="back" type="button" aria-label="Back">‹</button>
+          <h1 id="chat-title"></h1>
+          <button id="call" type="button" hidden></button>
+          <button id="leave" type="button" hidden></button>
+        </header>
+        <div id="messages" hidden></div>
+        <form id="compose" hidden>
+          <textarea id="text" rows="1"></textarea>
+          <button type="submit" id="send"></button>
+        </form>
+      </main>
+    </div>
+
+    <dialog id="contact-dialog">
+      <form method="dialog">
+        <label><span data-t="username"></span><input name="username" required autocomplete="off" /></label>
+        <p class="hint" data-t="contactHint"></p>
+        <menu><button value="cancel" formnovalidate data-t="cancel"></button><button value="ok" data-t="ask"></button></menu>
+      </form>
+    </dialog>
+
+    <dialog id="group-dialog">
+      <form method="dialog">
+        <label><span data-t="groupTitle"></span><input name="title" required /></label>
+        <fieldset id="group-members"><legend data-t="members"></legend></fieldset>
+        <menu><button value="cancel" formnovalidate data-t="cancel"></button><button value="ok" data-t="create"></button></menu>
+      </form>
+    </dialog>
+
+    <script src="/app-sdk.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
