@@ -5,13 +5,15 @@
 //! trusted; the display name is shown only next to the username (anyone may
 //! call themselves "Administrator").
 //!
-//! In each user's AppData (`.appdata/talk/`):
+//! In each user's AppData (`.appdata/rc-talk/`):
 //!
-//! | path                            | what                                          |
-//! |---------------------------------|-----------------------------------------------|
-//! | `contacts.json`                 | [`Book`]: contacts by id, my requests by username |
-//! | `rooms.json`                    | [`Rooms`]: chats with their members, unread   |
-//! | `rooms/<id>/<YYYY-MM-DD>.jsonl` | [`Message`]s of a chat, one file per day (UTC) |
+//! | path                            | what                                              |
+//! |---------------------------------|---------------------------------------------------|
+//! | `state.json`                    | [`Book`] (contacts by id, my requests by username) and `rooms` ([`Rooms`]: chats, members, unread) |
+//! | `rooms/<id>/<YYYY-MM-DD>.jsonl` | [`Message`]s of a chat, one file per day (UTC)     |
+//!
+//! One file for the book and the rooms: a change to both is one
+//! `write-if-match` (Talk 0.1 had `contacts.json` and `rooms.json`).
 
 use std::collections::BTreeMap;
 
@@ -154,6 +156,7 @@ impl Contact {
 
 /// Contacts by account id, and the usernames I asked (their id comes with the answer).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
 pub struct Book {
     pub contacts: BTreeMap<String, Contact>,
     pub asked: BTreeMap<String, DateTime<Utc>>,

@@ -1,9 +1,11 @@
 id = "rc-talk"
-version = "0.1.0"
+version = "0.2.0"
 # The version of wit/app.wit.
-api = "^0.2.18"
+api = "^0.2.19"
 # What the administrator sees on the plugin's Status tab.
 status = "/status"
+# Deliveries to one user never run at once: they rewrite the same state.json.
+one_batch_per_user = true
 
 [name]
 en = "Talk"
@@ -16,19 +18,17 @@ files = "none"
 # LiveKit's API (RoomService), to take someone out of a call when the owner
 # removes them from the group. The address comes from the setting below.
 network = ["{livekit_api_url}"]
+# Envelopes from one user to another (jobs.add-for): they run as the
+# recipient, with AppData only, and the server says who sent them.
+deliver = ["envelope"]
 
 [ui]
 icon = "chat"
 entry = "/app/rc-talk"
 
-# Until the core has jobs.add-for, messages travel through the plugin's
-# storage on the server. Off by default, for the test bench only: a build with
-# this setting never goes to the catalog. See docs/design.md, "Delivery".
-[[server_settings]]
-key = "storage_delivery"
-kind = "bool"
-label = { en = "Temporary delivery through the plugin's storage", ru = "Временная доставка через хранилище плагина" }
-hint = { en = "Test bench only. Messages wait in the plugin's shared storage until the recipient opens Talk; the sender is set by the plugin, not the server.", ru = "Только для стенда. Сообщения ждут в общем хранилище плагина, пока получатель не откроет Talk; отправителя проставляет плагин, а не сервер." }
+[[jobs]]
+kind = "envelope"
+batch = 50
 
 [[server_settings]]
 key = "livekit_url"

@@ -7,7 +7,10 @@
 //! | `/api/…`    | its JSON API ([`api`])                            |
 //! | `/status`   | the administrator's Status tab                    |
 
-wit_bindgen::generate!({ path: "wit", world: "app" });
+// The bindings of API 0.2.19 have a function of 8 arguments.
+#![allow(clippy::too_many_arguments)]
+
+wit_bindgen::generate!({ path: "wit", world: "app-with-jobs" });
 
 pub mod api;
 pub mod delivery;
@@ -38,6 +41,11 @@ impl Guest for App {
             _ => json(404, &json!({ "error": "NOT_FOUND" })),
         }
     }
+
+    /// Envelopes others sent to `user` (`jobs.add-for`).
+    fn run_batch(user: User, jobs: Vec<Job>) -> Vec<Outcome> {
+        delivery::run_batch(&user, &jobs)
+    }
 }
 
 export!(App);
@@ -45,23 +53,13 @@ export!(App);
 /// The Status tab: what works and what the administrator should do.
 fn status() -> Value {
     let values: Value = serde_json::from_str(&rustcloud::app::settings::values()).unwrap_or_default();
-    let mut lines = Vec::new();
-    match delivery::mode() {
-        delivery::Mode::Off => lines.push(json!({
-            "level": "warning",
-            "text": {
-                "en": "Delivery is off: users can't write to each other. Until the cloud supports delivery between users, turn on the temporary delivery through storage.",
-                "ru": "Доставка выключена: пользователи не могут писать друг другу. Пока облако не умеет доставку между пользователями, включите временную доставку через хранилище."
-            }
-        })),
-        delivery::Mode::Storage => lines.push(json!({
-            "level": "info",
-            "text": {
-                "en": "Temporary delivery through the plugin's storage: messages wait on the server until the recipient opens Talk.",
-                "ru": "Временная доставка через хранилище плагина: сообщения ждут на сервере, пока получатель не откроет Talk."
-            }
-        })),
-    }
+    let mut lines = vec![json!({
+        "level": "ok",
+        "text": {
+            "en": "Messages: delivered by the cloud. Who may write to whom is set in the plugin's system settings.",
+            "ru": "Сообщения: доставляет облако. Кто кому может писать — в системных настройках плагина."
+        }
+    })];
     if livekit::Config::from_settings(&values).is_some() {
         lines.push(
             json!({ "level": "ok", "text": { "en": "Calls: LiveKit is set up", "ru": "Звонки: LiveKit настроен" } }),

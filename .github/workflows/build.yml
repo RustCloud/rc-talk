@@ -107,7 +107,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v$VERSION"
-          notes="Install rc-talk.zip on Administration → Plugins → Install. Needs RustCloud with plugin API $(sed -n 's/^api = "\(.*\)"/\1/p' manifest.toml). Test bench only until the cloud has delivery between users (jobs.add-for): see README."
+          notes="Install rc-talk.zip on Administration → Plugins → Install. Needs RustCloud with plugin API $(sed -n 's/^api = "\(.*\)"/\1/p' manifest.toml)."
           if gh release view "$tag" >/dev/null 2>&1; then
             if [ "$GITHUB_REF_TYPE" != tag ]; then
               echo "Release $tag exists: nothing to publish (bump the version for a new one)."

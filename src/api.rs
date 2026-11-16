@@ -4,7 +4,6 @@
 //! | request                              | body                       | what                                  |
 //! |--------------------------------------|----------------------------|---------------------------------------|
 //! | `GET  /state`                        |                            | me, contacts, asked, rooms, what works |
-//! | `POST /sync`                         |                            | take what waits for me → `{taken}`    |
 //! | `POST /contacts`                     | `{username}`               | ask (or accept, if they asked)        |
 //! | `POST /contacts/accept`              | `{id}`                     | accept a request                      |
 //! | `POST /contacts/block`               | `{id}`                     | take nothing of theirs                |
@@ -19,15 +18,20 @@
 //! | `POST /rooms/<id>/delete`            | `{msg, at}`                | delete my message                     |
 //! | `POST /rooms/<id>/read`              |                            | nothing unread                        |
 //! | `POST /rooms/<id>/call`              |                            | `{url, token, room}` for LiveKit      |
+//!
+//! A change is checked on the state as loaded, sent, and then made with
+//! [`store::update`], which may make it again on a newer state (a delivery
+//! came in between): sending happens once, outside it.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::delivery::{self, Mode};
+use crate::delivery;
 use crate::inbox::{State, MAX_MEMBERS};
 use crate::model::*;
-use crate::rustcloud::app::{http, log, settings};
+use crate::rustcloud::app::{http, jobs, log, settings};
+use crate::store;
 use crate::{livekit, random_id, Response, User};
 
 type Failure = (u16, &'static str);
@@ -36,7 +40,7 @@ type Answer = Result<Value, Failure>;
 const BAD: Failure = (400, "BAD_REQUEST");
 const NOT_FOUND: Failure = (404, "NOT_FOUND");
 const FORBIDDEN: Failure = (403, "FORBIDDEN");
-const DELIVERY_OFF: Failure = (503, "DELIVERY_OFF");
+const TOO_MANY: Failure = (429, "TOO_MANY");
 
 pub fn handle(user: &User, method: &str, path: &str, query: &str, body: &[u8]) -> Response {
     match route(user, method, path, query, body) {
@@ -49,10 +53,6 @@ fn route(user: &User, method: &str, path: &str, query: &str, body: &[u8]) -> Ans
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, segments.as_slice()) {
         ("GET", ["state"]) => state(user),
-        ("POST", ["sync"]) => {
-            let taken = delivery::take_incoming(user).map_err(fail)?;
-            Ok(json!({ "taken": taken }))
-        }
         ("POST", ["contacts"]) => ask(user, parse::<Named>(body)?.username),
         ("POST", ["contacts", "accept"]) => accept(user, &parse::<Id>(body)?.id),
         ("POST", ["contacts", "block"]) => set_contact(user, &parse::<Id>(body)?.id, Some(ContactState::Blocked)),
@@ -110,27 +110,29 @@ struct Change {
 }
 
 fn load(user: &User) -> Result<State, Failure> {
-    crate::store::load(delivery::sender(user)).map_err(fail)
+    store::load(delivery::sender(user)).map_err(fail)
 }
 
-fn save(state: &State) -> Result<(), Failure> {
-    crate::store::save(state).map_err(fail)
+/// Makes a change to the state (see the module's doc).
+fn commit<T>(user: &User, change: impl FnMut(&mut State) -> T) -> Result<T, Failure> {
+    store::update(&delivery::sender(user), change).map_err(fail)
 }
 
 fn envelope(body: Body, sent_at: DateTime<Utc>) -> Envelope {
     Envelope { v: ENVELOPE_VERSION, id: random_id(), sent_at, body }
 }
 
-fn require_delivery() -> Result<(), Failure> {
-    match delivery::mode() {
-        Mode::Off => Err(DELIVERY_OFF),
-        Mode::Storage => Ok(()),
+fn sent(result: Result<(), delivery::Error>) -> Result<(), Failure> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(delivery::Error::TooMany) => Err(TOO_MANY),
+        Err(delivery::Error::Failed(e)) => Err(fail(e)),
     }
 }
 
 /// Sends a new envelope to account ids.
 fn deliver(user: &User, to: &[String], body: Body) -> Result<(), Failure> {
-    delivery::send(user, to, &envelope(body, Utc::now())).map_err(fail)
+    sent(delivery::send(user, to, &envelope(body, Utc::now())))
 }
 
 fn settings_json() -> Value {
@@ -139,12 +141,12 @@ fn settings_json() -> Value {
 
 fn state(user: &User) -> Answer {
     let state = load(user)?;
+    delivery::badge(state.waiting());
     Ok(json!({
         "me": { "id": user.id, "username": user.username, "display_name": user.display_name },
         "contacts": state.book.contacts,
         "asked": state.book.asked,
         "rooms": state.rooms,
-        "delivery": delivery::mode(),
         "calls": livekit::Config::from_settings(&settings_json()).is_some(),
     }))
 }
@@ -154,7 +156,7 @@ fn ask(user: &User, username: String) -> Answer {
     if !valid_username(&username) || username == user.username {
         return Err(BAD);
     }
-    let mut state = load(user)?;
+    let state = load(user)?;
     // Someone with this username already in the book: answer by their id.
     let known = state.book.contacts.iter().find(|(_, c)| c.username == username).map(|(id, c)| (id.clone(), c.state));
     match known {
@@ -162,44 +164,59 @@ fn ask(user: &User, username: String) -> Answer {
         Some((_, contact_state)) => return Ok(json!({ "state": contact_state })),
         None => {}
     }
-    require_delivery()?;
-    delivery::ask(user, &username, &envelope(Body::ContactRequest, Utc::now())).map_err(fail)?;
-    state.book.asked.insert(username, Utc::now());
-    save(&state)?;
+    sent(delivery::send(user, std::slice::from_ref(&username), &envelope(Body::ContactRequest, Utc::now())))?;
+    let now = Utc::now();
+    commit(user, |state| state.book.asked.insert(username.clone(), now))?;
     Ok(json!({ "state": "asked" }))
 }
 
 fn accept(user: &User, id: &str) -> Answer {
-    let mut state = load(user)?;
-    let contact = state.book.contacts.get(id).filter(|c| c.state == ContactState::Incoming).ok_or(NOT_FOUND)?;
-    let person = contact.person();
-    require_delivery()?;
+    let state = load(user)?;
+    state.book.contacts.get(id).filter(|c| c.state == ContactState::Incoming).ok_or(NOT_FOUND)?;
     deliver(user, &[id.to_owned()], Body::ContactAccept)?;
-    let contact = state.book.contacts.get_mut(id).expect("checked above");
-    contact.state = ContactState::Accepted;
-    contact.since = Utc::now();
-    state.direct_room(id, person);
-    save(&state)?;
+    let now = Utc::now();
+    let waiting = commit(user, |state| {
+        if let Some(contact) = state.book.contacts.get_mut(id).filter(|c| c.state == ContactState::Incoming) {
+            contact.state = ContactState::Accepted;
+            contact.since = now;
+            let person = contact.person();
+            state.direct_room(id, person);
+        }
+        state.waiting()
+    })?;
+    delivery::badge(waiting);
     Ok(json!({ "state": ContactState::Accepted }))
 }
 
 fn set_contact(user: &User, id: &str, to: Option<ContactState>) -> Answer {
-    let mut state = load(user)?;
-    match to {
-        // Only someone already in the book: their names came from the server.
-        Some(next) => state.book.contacts.get_mut(id).ok_or(NOT_FOUND)?.state = next,
-        None => {
-            state.book.contacts.remove(id);
+    // Only someone already in the book: their names came from the server.
+    let before = load(user)?.book.contacts.get(id).map(|c| c.state).ok_or(NOT_FOUND)?;
+    // The server stops what they send too, rings included, and drops what waits.
+    let server = match to {
+        Some(ContactState::Blocked) => jobs::block(id),
+        _ if before == ContactState::Blocked => jobs::unblock(id),
+        _ => Ok(()),
+    };
+    server.map_err(|e| fail(format!("block {id}: {e:?}")))?;
+    let waiting = commit(user, |state| {
+        match to {
+            Some(next) => {
+                if let Some(contact) = state.book.contacts.get_mut(id) {
+                    contact.state = next;
+                }
+            }
+            None => {
+                state.book.contacts.remove(id);
+            }
         }
-    }
-    save(&state)?;
+        state.waiting()
+    })?;
+    delivery::badge(waiting);
     Ok(json!({}))
 }
 
 fn cancel_ask(user: &User, username: &str) -> Answer {
-    let mut state = load(user)?;
-    state.book.asked.remove(username.trim());
-    save(&state)?;
+    commit(user, |state| state.book.asked.remove(username.trim()))?;
     Ok(json!({}))
 }
 
@@ -247,37 +264,33 @@ fn clean_title(title: &str) -> Result<String, Failure> {
 }
 
 fn new_group(user: &User, group: Group) -> Answer {
-    let mut state = load(user)?;
+    let state = load(user)?;
     let title = clean_title(&group.title)?;
     let members = group_members(&state, &[], &group.members)?;
-    require_delivery()?;
     let id = format!("g{}", random_id());
     let described = describe(&state, None, &members);
     deliver(user, &members, Body::RoomInvite { room: id.clone(), title: title.clone(), members: described.clone() })?;
-    state.rooms.insert(
-        id.clone(),
-        Room {
-            id: id.clone(),
-            peer: None,
-            title,
-            owner: user.id.clone(),
-            members,
-            names: described
-                .into_iter()
-                .map(|m| (m.id, Person { username: m.username, display_name: m.display_name }))
-                .collect(),
-            last_at: Some(Utc::now()),
-            last_text: String::new(),
-            unread: 0,
-            left: false,
-        },
-    );
-    save(&state)?;
+    let room = Room {
+        id: id.clone(),
+        peer: None,
+        title,
+        owner: user.id.clone(),
+        members,
+        names: described
+            .into_iter()
+            .map(|m| (m.id, Person { username: m.username, display_name: m.display_name }))
+            .collect(),
+        last_at: Some(Utc::now()),
+        last_text: String::new(),
+        unread: 0,
+        left: false,
+    };
+    commit(user, |state| state.rooms.insert(id.clone(), room.clone()))?;
     Ok(json!({ "id": id }))
 }
 
 fn change_group(user: &User, id: &str, group: Group) -> Answer {
-    let mut state = load(user)?;
+    let state = load(user)?;
     let room = state.rooms.get(id).filter(|r| r.peer.is_none() && !r.left).ok_or(NOT_FOUND)?;
     if room.owner != user.id {
         return Err(FORBIDDEN);
@@ -286,7 +299,6 @@ fn change_group(user: &User, id: &str, group: Group) -> Answer {
     let before = room.members.clone();
     let members = group_members(&state, &before, &group.members)?;
     let described = describe(&state, Some(room), &members);
-    require_delivery()?;
     // Everyone before and after hears of it: those taken out learn they left.
     let mut everyone = before.clone();
     everyone.extend(members.iter().filter(|m| !before.contains(m)).cloned());
@@ -306,13 +318,18 @@ fn change_group(user: &User, id: &str, group: Group) -> Answer {
     let removed: Vec<String> = before.iter().filter(|m| !members.contains(m)).cloned().collect();
     remove_from_call(id, &removed);
 
-    let room = state.rooms.get_mut(id).expect("checked above");
-    room.title = title;
-    room.members = members;
-    for member in described {
-        room.names.entry(member.id).or_insert(Person { username: member.username, display_name: member.display_name });
-    }
-    save(&state)?;
+    commit(user, |state| {
+        if let Some(room) = state.rooms.get_mut(id) {
+            room.title = title.clone();
+            room.members = members.clone();
+            for member in &described {
+                room.names.entry(member.id.clone()).or_insert_with(|| Person {
+                    username: member.username.clone(),
+                    display_name: member.display_name.clone(),
+                });
+            }
+        }
+    })?;
     Ok(json!({}))
 }
 
@@ -334,25 +351,23 @@ fn remove_from_call(room: &str, ids: &[String]) {
 }
 
 fn leave(user: &User, id: &str) -> Answer {
-    let mut state = load(user)?;
-    let room = state.rooms.get_mut(id).filter(|r| r.peer.is_none() && !r.left).ok_or(NOT_FOUND)?;
+    let state = load(user)?;
+    let room = state.rooms.get(id).filter(|r| r.peer.is_none() && !r.left).ok_or(NOT_FOUND)?;
     let others: Vec<String> = room.members.iter().filter(|m| **m != user.id).cloned().collect();
-    require_delivery()?;
     deliver(user, &others, Body::RoomLeave { room: id.to_owned() })?;
-    let room = state.rooms.get_mut(id).expect("checked above");
-    room.members.retain(|m| *m != user.id);
-    room.left = true;
-    save(&state)?;
+    commit(user, |state| {
+        if let Some(room) = state.rooms.get_mut(id) {
+            room.members.retain(|m| *m != user.id);
+            room.left = true;
+        }
+    })?;
     Ok(json!({}))
 }
 
 /// A room I may write in, and who else gets what I write.
-fn writable<'a>(state: &'a mut State, user: &User, id: &str) -> Result<(&'a mut Room, Vec<String>), Failure> {
-    let peer_ok = match state.rooms.get(id).and_then(|r| r.peer.clone()) {
-        Some(peer) => state.accepted(&peer),
-        None => true,
-    };
-    let room = state.rooms.get_mut(id).ok_or(NOT_FOUND)?;
+fn writable<'a>(state: &'a State, user: &User, id: &str) -> Result<(&'a Room, Vec<String>), Failure> {
+    let room = state.rooms.get(id).ok_or(NOT_FOUND)?;
+    let peer_ok = room.peer.as_ref().is_none_or(|peer| state.accepted(peer));
     if room.left || !room.members.contains(&user.id) || !peer_ok {
         return Err(FORBIDDEN);
     }
@@ -363,7 +378,7 @@ fn writable<'a>(state: &'a mut State, user: &User, id: &str) -> Result<(&'a mut 
 fn messages(user: &User, id: &str, before: &str) -> Answer {
     let state = load(user)?;
     let room = state.rooms.get(id).ok_or(NOT_FOUND)?;
-    let (messages, older) = crate::store::recent(&room.id, before, 100).map_err(fail)?;
+    let (messages, older) = store::recent(&room.id, before, 100).map_err(fail)?;
     Ok(json!({ "messages": messages, "older": older }))
 }
 
@@ -372,15 +387,14 @@ fn send(user: &User, id: &str, text: &str) -> Answer {
     if text.trim().is_empty() {
         return Err(BAD);
     }
-    require_delivery()?;
-    let mut state = load(user)?;
-    let (room, others) = writable(&mut state, user, id)?;
+    let state = load(user)?;
+    let (room, others) = writable(&state, user, id)?;
     let start = Utc::now();
-    let mut sent = Vec::new();
+    let mut done = Vec::new();
     for (i, part) in split_text(text).into_iter().enumerate() {
         let envelope =
             envelope(Body::Msg { room: room.id.clone(), text: part.clone() }, start + Duration::milliseconds(i as i64));
-        delivery::send(user, &others, &envelope).map_err(fail)?;
+        sent(delivery::send(user, &others, &envelope))?;
         let message = Message {
             id: envelope.id.clone(),
             from: user.id.clone(),
@@ -389,13 +403,21 @@ fn send(user: &User, id: &str, text: &str) -> Answer {
             edited: false,
             deleted: false,
         };
-        crate::store::append(&room.id, message.clone()).map_err(fail)?;
-        room.last_at = Some(message.at);
-        room.last_text = message.text.chars().take(100).collect();
-        sent.push(message);
+        store::append(&room.id, message.clone()).map_err(fail)?;
+        done.push(message);
     }
-    save(&state)?;
-    Ok(json!({ "messages": sent }))
+    if let Some(last) = done.last() {
+        let (at, text): (_, String) = (last.at, last.text.chars().take(100).collect());
+        commit(user, |state| {
+            if let Some(room) = state.rooms.get_mut(id) {
+                if room.last_at.is_none_or(|l| l <= at) {
+                    room.last_at = Some(at);
+                    room.last_text = text.clone();
+                }
+            }
+        })?;
+    }
+    Ok(json!({ "messages": done }))
 }
 
 fn edit(user: &User, id: &str, change: Change) -> Answer {
@@ -403,43 +425,40 @@ fn edit(user: &User, id: &str, change: Change) -> Answer {
     if text.trim().is_empty() || split_text(&text).len() > 1 {
         return Err(BAD);
     }
-    require_delivery()?;
-    let mut state = load(user)?;
-    let (room, others) = writable(&mut state, user, id)?;
+    let state = load(user)?;
+    let (room, others) = writable(&state, user, id)?;
     let room_id = room.id.clone();
     deliver(
         user,
         &others,
         Body::MsgEdit { room: room_id.clone(), msg: change.msg.clone(), at: change.at, text: text.clone() },
     )?;
-    crate::store::edit(&room_id, &day_of(&change.at), &change.msg, &user.id, &text).map_err(fail)?;
+    store::edit(&room_id, &day_of(&change.at), &change.msg, &user.id, &text).map_err(fail)?;
     Ok(json!({}))
 }
 
 fn delete(user: &User, id: &str, change: Change) -> Answer {
-    require_delivery()?;
-    let mut state = load(user)?;
-    let (room, others) = writable(&mut state, user, id)?;
+    let state = load(user)?;
+    let (room, others) = writable(&state, user, id)?;
     let room_id = room.id.clone();
     deliver(user, &others, Body::MsgDelete { room: room_id.clone(), msg: change.msg.clone(), at: change.at })?;
-    crate::store::delete(&room_id, &day_of(&change.at), &change.msg, &user.id).map_err(fail)?;
+    store::delete(&room_id, &day_of(&change.at), &change.msg, &user.id).map_err(fail)?;
     Ok(json!({}))
 }
 
 fn read(user: &User, id: &str) -> Answer {
-    let mut state = load(user)?;
-    let room = state.rooms.get_mut(id).ok_or(NOT_FOUND)?;
-    if room.unread > 0 {
-        room.unread = 0;
-        save(&state)?;
-    }
+    let waiting = commit(user, |state| {
+        let found = state.rooms.get_mut(id).map(|room| room.unread = 0).is_some();
+        found.then(|| state.waiting())
+    })?;
+    delivery::badge(waiting.ok_or(NOT_FOUND)?);
     Ok(json!({}))
 }
 
 fn call(user: &User, id: &str) -> Answer {
     let config = livekit::Config::from_settings(&settings_json()).ok_or((503, "CALLS_OFF"))?;
-    let mut state = load(user)?;
-    let (room, _) = writable(&mut state, user, id)?;
+    let state = load(user)?;
+    let (room, _) = writable(&state, user, id)?;
     let name = Person { username: user.username.clone(), display_name: user.display_name.clone() }.label();
     let token = livekit::join_token(&config, &room.id, &user.id, &name, Utc::now().timestamp());
     Ok(json!({ "url": config.url, "token": token, "room": livekit::room_name(&room.id) }))

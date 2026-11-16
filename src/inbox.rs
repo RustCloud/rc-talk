@@ -38,6 +38,12 @@ impl State {
         self.book.contacts.get(id).is_some_and(|c| c.state == ContactState::Accepted)
     }
 
+    /// The number by Talk in the side panel: unread messages and requests.
+    pub fn waiting(&self) -> u32 {
+        let requests = self.book.contacts.values().filter(|c| c.state == ContactState::Incoming).count() as u32;
+        self.rooms.values().filter(|r| !r.left).map(|r| r.unread).sum::<u32>() + requests
+    }
+
     /// The direct chat with `peer`, made if there is none.
     pub fn direct_room(&mut self, peer: &str, person: Person) -> &mut Room {
         let id = direct_room_id(&self.me.id, peer);
@@ -306,6 +312,21 @@ mod tests {
         );
         assert_eq!(alice.rooms[&room].unread, 1);
         assert_eq!(alice.rooms[&room].title, "BOB (bob)");
+    }
+
+    #[test]
+    fn the_badge_counts_unread_and_requests() {
+        let mut alice = state("alice");
+        befriend(&mut alice, "bob");
+        let room = direct_room_id("id-alice", "id-bob");
+        for _ in 0..2 {
+            let msg = Body::Msg { room: room.clone(), text: "hi".into() };
+            apply(&mut alice, &sender("bob"), &envelope(msg), Utc::now());
+        }
+        apply(&mut alice, &sender("carol"), &envelope(Body::ContactRequest), Utc::now());
+        assert_eq!(alice.waiting(), 3);
+        alice.rooms.get_mut(&room).unwrap().left = true;
+        assert_eq!(alice.waiting(), 1);
     }
 
     #[test]

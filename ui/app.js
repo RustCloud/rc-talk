@@ -1,30 +1,29 @@
 // The Talk page: contacts, chats and messages. It runs in the panel's
 // sandboxed <iframe>; every request goes through rustcloud.fetch.
 //
-// New messages: until the cloud has the SSE event `changed`
-// (rustcloud.onEvent), the page asks /api/sync every few seconds while it is
-// visible and rarely while hidden.
+// New messages: the cloud delivers them into the user's AppData and tells
+// the page with the event `changed` (rustcloud.onEvent); the page reloads.
 (async () => {
   const TEXTS = {
     en: {
       addContact: '+ Contact', addGroup: '+ Group', username: 'Username',
-      contactHint: 'They will see your request when they open Talk.',
+      contactHint: 'If this user may receive messages from you, they will see the request.',
       cancel: 'Cancel', ask: 'Send request', create: 'Create', groupTitle: 'Name', members: 'Members',
       requests: 'Requests', accept: 'Accept', block: 'Block', waiting: 'waiting for answer',
       empty: 'Choose a chat or add a contact.', send: 'Send', placeholder: 'Message',
       call: 'Call', callsSoon: 'Calls will work once the cloud allows the camera for plugins.',
-      deliveryOff: 'Delivery is off on this server: ask the administrator.',
+      tooMany: 'Too many messages at once: wait a minute.',
       edited: 'edited', deleted: 'Message deleted', older: 'Older messages', left: 'You are no longer in this group.',
       edit: 'Edit', remove: 'Delete', failed: 'Something went wrong.', leave: 'Leave',
     },
     ru: {
       addContact: '+ Контакт', addGroup: '+ Группа', username: 'Имя пользователя',
-      contactHint: 'Человек увидит запрос, когда откроет «Общение».',
+      contactHint: 'Если этому пользователю можно вам писать, он увидит запрос.',
       cancel: 'Отмена', ask: 'Отправить запрос', create: 'Создать', groupTitle: 'Название', members: 'Участники',
       requests: 'Запросы', accept: 'Принять', block: 'Заблокировать', waiting: 'ждёт ответа',
       empty: 'Выберите беседу или добавьте контакт.', send: 'Отправить', placeholder: 'Сообщение',
       call: 'Позвонить', callsSoon: 'Звонки заработают, когда облако разрешит плагинам камеру.',
-      deliveryOff: 'Доставка на этом сервере выключена: обратитесь к администратору.',
+      tooMany: 'Слишком много сообщений сразу: подождите минуту.',
       edited: 'изменено', deleted: 'Сообщение удалено', older: 'Раньше', left: 'Вас больше нет в этой группе.',
       edit: 'Изменить', remove: 'Удалить', failed: 'Что-то пошло не так.', leave: 'Выйти',
     },
@@ -77,9 +76,7 @@
 
   // ——— the list ———
   function renderSide() {
-    const notice = $('notice');
-    notice.hidden = state.delivery !== 'off';
-    notice.textContent = t.deliveryOff;
+    $('notice').hidden = true;
 
     const requests = $('requests');
     requests.replaceChildren();
@@ -272,7 +269,7 @@
       await refresh();
       return true;
     } catch (error) {
-      alertBox(error.code === 'DELIVERY_OFF' ? t.deliveryOff : t.failed);
+      alertBox(error.code === 'TOO_MANY' ? t.tooMany : t.failed);
       return false;
     }
   }
@@ -283,25 +280,35 @@
     renderSide();
   }
 
-  async function sync() {
-    try {
-      const { taken } = await api('/sync', {});
-      if (taken) {
-        await refresh();
-        if (current) await reloadRoom();
-      }
-    } catch { /* next time */ }
+  // Something came: reload what is shown. Events that come while loading
+  // are folded into one more reload.
+  let loading = null;
+  let again = false;
+  async function update() {
+    if (loading) { again = true; return; }
+    loading = (async () => {
+      do {
+        again = false;
+        try {
+          await refresh();
+          if (current && state.rooms[current]) {
+            await reloadRoom();
+            // Seen as it came: no unread mark, no number in the side panel.
+            if (state.rooms[current].unread && !document.hidden) {
+              await api(`/rooms/${current}/read`, {});
+              await refresh();
+            }
+          }
+        } catch { /* the next event or a return to the tab */ }
+      } while (again);
+    })();
+    await loading;
+    loading = null;
   }
 
-  let timer = null;
-  function schedule() {
-    clearTimeout(timer);
-    timer = setTimeout(async () => { await sync(); schedule(); }, document.hidden ? 30000 : 3000);
-  }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(); schedule(); });
-  if (rustcloud.onEvent) rustcloud.onEvent(() => sync());
+  rustcloud.onEvent((event) => { if (event.type === 'changed') update(); });
+  // The panel's events reach only an open page: catch up on return.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) update(); });
 
   await refresh();
-  await sync();
-  schedule();
 })();
