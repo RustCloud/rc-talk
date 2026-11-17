@@ -1,5 +1,5 @@
 id = "rc-talk"
-version = "0.2.0"
+version = "0.2.1"
 # The version of wit/app.wit.
 api = "^0.2.19"
 # What the administrator sees on the plugin's Status tab.
